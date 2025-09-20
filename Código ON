@@ -1,0 +1,523 @@
+# train_on_full.py
+# -------------------------------------------------------------
+# ON - Treinamento do zero (tokenizer, transformer do zero,
+# visão computacional básica, áudio básico, 15 datasets placeholders)
+# -------------------------------------------------------------
+# Execute com Python 3.8+ e GPUs (recomendado)
+# -------------------------------------------------------------
+
+import os
+import math
+import time
+import argparse
+from typing import List, Iterator, Tuple, Optional, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, normalizers
+from datasets import load_dataset
+
+# Visão / áudio utilitários
+from PIL import Image
+from torchvision import transforms
+import torchaudio
+
+# tqdm
+from tqdm import tqdm
+
+# ----------------------------
+# CONFIG PADRÃO (ajuste conforme infra)
+# ----------------------------
+DEFAULT_VOCAB_SIZE = 2000000  # 2M tokens
+DEFAULT_MAX_SEQ = 2048
+DEFAULT_EMBED = 1024  # ajuste (ex: 4096/8192 p/ cluster real)
+DEFAULT_LAYERS = 12   # exemplo menor por padrão; altere para 66 para execução real
+DEFAULT_HEADS = 16    # altere para 66 conforme infra
+DEFAULT_BATCH = 2
+CHECKPOINT_DIR = "checkpoints_on"
+
+# ----------------------------
+# 15 DATASETS SUGERIDOS (substituir por IDs exatos do HF)
+# ----------------------------
+# Você deve ajustar esses IDs para os que deseja usar no HF Hub.
+DATASET_IDS_TEXT = [
+    "wikipedia",                # multilingual (use configs por idioma)
+    "openwebtext",              # openwebtext
+    "bookcorpus",               # bookcorpus
+    "pile",                     # EleutherAI/pile
+    "cc_news",                  # cc news-like (variações no Hub)
+    "wikitext",                 # wikitext
+    "arxiv",                    # arxiv
+    "pubmed",                   # pubmed or pubmed_abstracts
+    "europarl",                 # europarl
+    "open_subtitles",           # subtitles
+]
+
+DATASET_IDS_IMAGE = [
+    "coco",                     # MS COCO (captions)
+    "openimages",               # openimages
+    "image_corpus_placeholder"  # substitua por dataset de imagens local/LAION se tiver
+]
+
+DATASET_IDS_AUDIO = [
+    "mozilla-foundation/common_voice",  # Common Voice (múltiplas línguas)
+    "voxpopuli",                         # speech dataset (multilingue)
+    "speech_commands"                    # ex. para áudio curto
+]
+
+# junte os datasets em uma lista final (texto + imagem + áudio)
+# para streaming iremos montar iterators separados por modalidade
+# ------------------------------------------------------------
+
+# ----------------------------
+# Tokenizer (BPE) - treinar do zero (tokenizers)
+# ----------------------------
+class ONTokenizerWrapper:
+    def __init__(self, vocab_size:int=DEFAULT_VOCAB_SIZE, path_out: str = "on_tokenizer.json"):
+        self.vocab_size = vocab_size
+        self.path_out = path_out
+        # BPE model
+        self.tokenizer = Tokenizer(models.BPE())
+        self.tokenizer.normalizer = normalizers.NFKC()
+        self.tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        self.trainer = trainers.BpeTrainer(vocab_size=self.vocab_size, special_tokens=["[PAD]","[UNK]","[CLS]","[SEP]"])
+        self._is_trained = False
+
+    def train_from_iterator(self, iterator: Iterator[str], show_progress: bool = True, batch_size:int=1000):
+        # tokenizers can train from iterator
+        print("[Tokenizer] Iniciando treino do BPE (pode demorar)...")
+        self.tokenizer.train_from_iterator(iterator, trainer=self.trainer)
+        self.tokenizer.save(self.path_out)
+        self._is_trained = True
+        print(f"[Tokenizer] Salvou em {self.path_out}")
+
+    def load(self):
+        if os.path.exists(self.path_out):
+            self.tokenizer = Tokenizer.from_file(self.path_out)
+            self._is_trained = True
+            print("[Tokenizer] Carregado do disco.")
+        else:
+            raise FileNotFoundError("Tokenizer não encontrado. Treine-o primeiro.")
+
+    def encode_ids(self, text: str, max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        ids = self.tokenizer.encode(text).ids
+        if len(ids) > max_length:
+            return ids[:max_length]
+        return ids
+
+    def pad_truncate(self, ids: List[int], max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        if len(ids) >= max_length:
+            return ids[:max_length]
+        pad_id = self.tokenizer.token_to_id("[PAD]") if "[PAD]" in self.tokenizer.get_vocab() else 0
+        return ids + [pad_id] * (max_length - len(ids))
+
+    def vocab_size(self):
+        return len(self.tokenizer.get_vocab())
+
+# ----------------------------
+# Datasets streaming helpers
+# ----------------------------
+def text_stream_iterator(hf_id:str, config_name: Optional[str]=None, field_candidates: List[str]=["text","article","content"]):
+    """
+    Retorna um generator de strings (streaming se possível).
+    Substitua hf_id/config_name por IDs reais. Nem todos datasets suportam streaming de imagens.
+    """
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Dataset] Não foi possível abrir {hf_id} (streaming): {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                for k in field_candidates:
+                    if k in ex and isinstance(ex[k], str):
+                        yield ex[k]
+                        break
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def image_dataset_iterator(hf_id:str):
+    """
+    Alguns datasets de imagens não suportam streaming - pode ser necessário download local.
+    Aqui tentamos carregar, mas se falhar, retorna iter([]).
+    """
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        print(f"[Dataset] Imagem {hf_id} não acessível via HF API: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            # ex['image'] pode ser PIL.Image ou dict
+            img = None
+            if isinstance(ex, dict):
+                if "image" in ex:
+                    img = ex["image"]
+                elif "img" in ex:
+                    img = ex["img"]
+            if img is not None:
+                caption = ex.get("caption", "") if isinstance(ex, dict) else ""
+                yield img, caption
+    return gen()
+
+def audio_dataset_iterator(hf_id:str, config_name:Optional[str]=None):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Dataset] Áudio {hf_id} não acessível (streaming): {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict) and "audio" in ex:
+                # ex['audio'] normalmente dict com 'array' ou path; aqui devolvemos o campo
+                yield ex["audio"], ex.get("sentence", "") or ex.get("text", "")
+    return gen()
+
+# ----------------------------
+# Vision encoder (básico) - pequeno CNN
+# ----------------------------
+class VisionEncoder(nn.Module):
+    def __init__(self, embed_dim:int):
+        super().__init__()
+        # simples CNN -> proj para embed_dim
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+        self.fc = nn.Linear(128, embed_dim)
+
+    def forward(self, img_tensor):
+        # img_tensor: [batch, 3, H, W], values 0..1
+        feat = self.conv(img_tensor)
+        return self.fc(feat)  # [batch, embed_dim]
+
+# ----------------------------
+# Audio encoder (básico) - log-mel -> small CNN/FF
+# ----------------------------
+class AudioEncoder(nn.Module):
+    def __init__(self, embed_dim:int, sample_rate:int=16000, n_mels:int=80):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        # simple frontend: torchaudio.transforms.MelSpectrogram can be used externally
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_mels, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()
+        )
+        self.fc = nn.Linear(256, embed_dim)
+
+    def forward(self, mel_tensor):
+        # mel_tensor: [batch, n_mels, T]
+        feat = self.conv(mel_tensor)
+        return self.fc(feat)
+
+# ----------------------------
+# Advanced Transformer block (from zero)
+# ----------------------------
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, dropout:float=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, embed_dim*3, bias=False)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        # x: [seq, batch, embed]
+        seq_len, bsz, _ = x.size()
+        qkv = self.qkv(x)  # [seq, batch, 3*embed]
+        qkv = qkv.view(seq_len, bsz, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        # transpose to [batch, heads, seq, head_dim]
+        q = q.permute(1,2,0,3)
+        k = k.permute(1,2,0,3)
+        v = v.permute(1,2,0,3)
+        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(mask==0, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        context = torch.matmul(attn, v)  # [batch, heads, seq, head_dim]
+        context = context.permute(2,0,1,3).contiguous()
+        context = context.view(seq_len, bsz, self.embed_dim)
+        out = self.out(context)
+        out = self.proj_dropout(out)
+        return out
+
+class AdvancedTransformerBlock(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, ffn_dim:int, dropout:float=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, embed_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        # pre-norm
+        res = x
+        x = self.norm1(x)
+        x = self.attn(x, mask=mask)
+        x = res + self.dropout(x)
+        res2 = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = res2 + self.dropout(x)
+        return x
+
+# ----------------------------
+# ThoughtModule (cadeia de pensamento discreta)
+# ----------------------------
+class ThoughtModule(nn.Module):
+    def __init__(self, embed_dim:int, n_steps:int=8, n_layers:int=2, n_heads:int=8):
+        super().__init__()
+        self.n_steps = n_steps
+        self.start_tokens = nn.Parameter(torch.randn(n_steps, 1, embed_dim))
+        self.layers = nn.ModuleList([AdvancedTransformerBlock(embed_dim, n_heads, embed_dim*2, dropout=0.1) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, context: torch.Tensor):
+        # context: [seq, batch, embed]
+        seq_len, bsz, embed = context.size()
+        thoughts = self.start_tokens.expand(-1, bsz, -1)  # [n_steps, batch, embed]
+        combined = torch.cat([context, thoughts], dim=0)  # [seq + n_steps, batch, embed]
+        for layer in self.layers:
+            combined = layer(combined)
+        return self.norm(combined[-self.n_steps:])  # [n_steps, batch, embed]
+
+# ----------------------------
+# Modelo ON completo (do zero)
+# ----------------------------
+class ONModel(nn.Module):
+    def __init__(self, vocab_size:int, embed_dim:int, num_layers:int, num_heads:int, max_seq:int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.max_seq = max_seq
+
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        # pos embeddings - learned
+        self.pos_emb = nn.Parameter(torch.randn(max_seq, 1, embed_dim))
+        self.layers = nn.ModuleList([AdvancedTransformerBlock(embed_dim, num_heads, embed_dim*4, dropout=0.1) for _ in range(num_layers)])
+        self.thought = ThoughtModule(embed_dim, n_steps=8, n_layers=2, n_heads=8)
+        self.final_ln = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size)
+
+        # multimodal projectors (vision/audio) -> embed_dim
+        self.vision_proj = nn.Linear(embed_dim, embed_dim)
+        self.audio_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, input_ids: torch.LongTensor, vision_emb: Optional[torch.Tensor]=None, audio_emb: Optional[torch.Tensor]=None):
+        """
+        input_ids: [batch, seq]
+        vision_emb: [batch, embed] or None
+        audio_emb: [batch, embed] or None
+        """
+        bsz, seq = input_ids.size()
+        x = self.token_emb(input_ids)  # [batch, seq, embed]
+        x = x.transpose(0,1)  # [seq, batch, embed]
+        # add pos
+        pos = self.pos_emb[:seq, :, :].to(x.device)
+        x = x + pos  # broadcasting
+        for layer in self.layers:
+            x = layer(x)
+        # thought
+        thought_repr = self.thought(x)  # [n_steps, batch, embed]
+        # optionally fuse vision/audio by projecting and adding to the first token embedding
+        if vision_emb is not None:
+            v = self.vision_proj(vision_emb).unsqueeze(0)  # [1, batch, embed]
+            x = x + v  # broadcasting across sequence
+        if audio_emb is not None:
+            a = self.audio_proj(audio_emb).unsqueeze(0)
+            x = x + a
+        # concat thoughts then final ln
+        x = torch.cat([x, thought_repr], dim=0)  # [seq + n_steps, batch, embed]
+        x = self.final_ln(x)
+        token_slice = x[:seq, :, :].transpose(0,1)  # [batch, seq, embed]
+        logits = self.head(token_slice)
+        return logits
+
+# ----------------------------
+# Training utilities: collate / batch generation
+# ----------------------------
+text_transform = None  # placeholder, not needed for text
+image_transform = transforms.Compose([
+    transforms.Resize((128,128)),
+    transforms.ToTensor()
+])
+
+def collate_texts(tokenizer: ONTokenizerWrapper, texts: List[str], max_len:int=DEFAULT_MAX_SEQ):
+    ids = [tokenizer.encode_ids(t, max_length=max_len) for t in texts]
+    ids = [tokenizer.pad_truncate(i, max_length=max_len) for i in ids]
+    return torch.tensor(ids, dtype=torch.long)
+
+# ----------------------------
+# Treino - esqueleto principal (funcional)
+# ----------------------------
+def train_real(args):
+    # args: hyperparams
+    # 1) montar/treinar tokenizer (caso não exista)
+    tk = ONTokenizerWrapper(vocab_size=args.vocab_size, path_out=args.tokenizer_path)
+    if os.path.exists(args.tokenizer_path):
+        tk.load()
+    else:
+        # build a small mixed iterator from several text datasets (streaming)
+        def combined_text_iter():
+            for ds in args.text_datasets:
+                it = text_stream_iterator(ds)
+                for s in it:
+                    yield s
+        tk.train_from_iterator(combined_text_iter())
+
+    # 2) build dataset iterators (streaming)
+    text_iters = {ds: text_stream_iterator(ds) for ds in args.text_datasets}
+    image_iters = {ds: image_dataset_iterator(ds) for ds in args.image_datasets}
+    audio_iters = {ds: audio_dataset_iterator(ds) for ds in args.audio_datasets}
+
+    # 3) build model
+    model = ONModel(vocab_size=len(tk.tokenizer.get_vocab()), embed_dim=args.embed_dim, num_layers=args.layers, num_heads=args.heads, max_seq=args.max_seq)
+    model.to(args.device)
+
+    # vision/audio encoders
+    vision_encoder = VisionEncoder(args.embed_dim).to(args.device)
+    audio_encoder = AudioEncoder(args.embed_dim).to(args.device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # training loop: sample from datasets iterators
+    print("[TRAIN] Iniciando loop de treino (esqueleto).")
+    steps = 0
+    for epoch in range(args.epochs):
+        print(f"[TRAIN] Época {epoch+1}/{args.epochs}")
+        # simple loop: iterate text iterators and train small number of batches
+        for ds_name, iterator in text_iters.items():
+            print(f"  Dataset text: {ds_name}")
+            batch_texts = []
+            for i, txt in enumerate(iterator):
+                if not isinstance(txt, str): 
+                    continue
+                batch_texts.append(txt)
+                if len(batch_texts) == args.batch_size:
+                    input_ids = collate_texts(tk, batch_texts, max_len=args.max_seq).to(args.device)
+                    # optionally sample a random image/audio and encode
+                    vision_emb = None
+                    audio_emb = None
+                    # sample image
+                    for img_ds, img_it in image_iters.items():
+                        try:
+                            img, caption = next(img_it)
+                            # ensure PIL
+                            if isinstance(img, dict) and "path" in img:
+                                img = Image.open(img["path"]).convert("RGB")
+                            if isinstance(img, Image.Image):
+                                pil = img
+                                t = image_transform(pil).unsqueeze(0).to(args.device)
+                                vision_emb = vision_encoder(t)  # [1, embed]
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+                    # sample audio
+                    for a_ds, a_it in audio_iters.items():
+                        try:
+                            aud, meta = next(a_it)
+                            # 'aud' could be dict {'array':..., 'sampling_rate':...}
+                            if isinstance(aud, dict) and "array" in aud:
+                                arr = torch.tensor(aud["array"]).float().unsqueeze(0)
+                                # convert to mel with torchaudio transforms
+                                mel = torchaudio.transforms.MelSpectrogram()(arr)
+                                audio_emb = audio_encoder(mel)
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    # forward / loss
+                    logits = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)  # [batch, seq, vocab]
+                    labels = input_ids
+                    loss_f = nn.CrossEntropyLoss(ignore_index=tk.tokenizer.token_to_id("[PAD]") if "[PAD]" in tk.tokenizer.get_vocab() else -100)
+                    loss = loss_f(logits.view(-1, model.vocab_size), labels.view(-1))
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+                    steps += 1
+                    if steps % args.log_every == 0:
+                        print(f"  Step {steps} loss: {loss.item():.4f}")
+
+                    batch_texts = []
+                # optional small break to avoid infinite streaming runs in example
+                if i > args.max_examples_per_dataset:
+                    break
+            # end dataset
+        # epoch end
+        # checkpoint
+        ckpt_path = os.path.join(args.checkpoint_dir, f"on_epoch{epoch+1}.pt")
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, ckpt_path)
+        print(f"[TRAIN] Checkpoint salvo: {ckpt_path}")
+
+    print("[TRAIN] Loop finalizado (exemplo).")
+
+# ----------------------------
+# CLI / main
+# ----------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--vocab_size", type=int, default=50000)  # por padrão reduzido para teste
+    p.add_argument("--max_seq", type=int, default=1024)
+    p.add_argument("--embed_dim", type=int, default=DEFAULT_EMBED)
+    p.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
+    p.add_argument("--heads", type=int, default=DEFAULT_HEADS)
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default=str(DEVICE))
+    p.add_argument("--tokenizer_path", type=str, default="on_tokenizer.json")
+    p.add_argument("--checkpoint_dir", type=str, default=CHECKPOINT_DIR)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--max_examples_per_dataset", type=int, default=200)  # limite por dataset em exemplo
+    p.add_argument("--text_datasets", nargs="+", default=DATASET_IDS_TEXT)
+    p.add_argument("--image_datasets", nargs="+", default=DATASET_IDS_IMAGE)
+    p.add_argument("--audio_datasets", nargs="+", default=DATASET_IDS_AUDIO)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    # convert device
+    args.device = torch.device(args.device)
+    args.batch_size = args.batch_size
+    args.checkpoint_dir = args.checkpoint_dir
+    train_real(args)
